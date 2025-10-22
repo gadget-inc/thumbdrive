@@ -1,0 +1,37 @@
+name: "Test"
+on:
+  push:
+  workflow_call:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: ./.github/actions/setup-test-env
+      - name: Build
+        shell: bash
+        run: pnpm build
+      - name: Test
+        shell: bash
+        run: pnpm test
+
+  test-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: ./.github/actions/setup-test-env
+      - name: Build
+        shell: bash
+        run: pnpm build
+      - name: Test E2E
+        shell: bash
+        run: pnpm e2e
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: ./.github/actions/setup-test-env
+      - name: Lint
+        shell: bash
+        run: pnpm lint

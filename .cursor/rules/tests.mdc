@@ -1,0 +1,8 @@
+---
+description: "how to run tests"
+alwaysApply: true
+---
+
+Tests are written using vitest and live in the `spec` dir. Run all the tests with `pnpm test`. Run one test with `pnpm test -- -t "some test name"`
+
+Don't just skip tests if you can't get them to work, that's unhelpful. Keep working to get them passing, or if stuck, ask for guidance from the user.
