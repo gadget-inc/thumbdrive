@@ -1,0 +1,16 @@
+.DS_STORE
+dist
+node_modules
+*~
+*.pyc
+.module-cache
+*.gem
+*.log*
+*.sublime-project
+*.sublime-workspace
+.idea
+*.iml
+.direnv
+*.cpuprofile
+*.heapprofile
+test-results

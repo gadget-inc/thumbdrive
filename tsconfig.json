@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "lib": ["es2020", "DOM", "WebWorker"],
+    "baseUrl": "./",
+    "moduleResolution": "node",
+    "module": "es2022",
+    "target": "es2022",
+    "types": ["vitest", "node"],
+    "outDir": "./dist",
+    "strict": true,
+    "declaration": true,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "spec", "testapp"]
+}
