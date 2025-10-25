@@ -20,14 +20,23 @@ const broker = new MultiTabWorkerBroker("opfs-worker-lock", async () => {
   // Start listening
   initConnection.listen();
 
-  // Initialize the worker
-  await initConnection.sendRequest(InitializeRequest, { arena });
+  try {
+    // Initialize the worker with a reasonable timeout
+    await initConnection.sendRequest(InitializeRequest, { arena });
 
-  // Dispose the temporary connection (but keep the worker running)
-  initConnection.dispose();
+    // Give a moment for any pending messages to be processed
+    await new Promise(resolve => setTimeout(resolve, 10));
+    
+    // Dispose the temporary connection (but keep the worker running)
+    initConnection.dispose();
+  } catch (error) {
+    // If initialization fails, clean up the worker
+    worker.terminate();
+    throw error;
+  }
 
   return worker;
-});
+}, { debug: true });
 
 // Create a connection from the broker
 const brokerConnection = broker.createConnection();

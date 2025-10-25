@@ -42,5 +42,3 @@ self.addEventListener("message", (event: MessageEvent) => {
     self.postMessage(message);
   }
 });
-
-

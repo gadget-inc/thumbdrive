@@ -745,42 +745,6 @@ describe("MultiTabWorkerBroker", () => {
       await broker2.stop();
     });
 
-    it("should handle concurrent requests with same ID from same broker", async () => {
-      const lockName = getLockName();
-      const broker1 = new MultiTabWorkerBroker(lockName, makeWorker);
-
-      const messages1: any[] = [];
-      const conn1 = broker1.createConnection();
-      conn1.reader.listen((msg) => messages1.push(msg));
-
-      await broker1.start();
-
-      // Send two concurrent requests with the same ID (unusual but possible)
-      const promise1 = conn1.writer.write({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "add",
-        params: { a: 1, b: 1 },
-      } as any);
-
-      const promise2 = conn1.writer.write({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "add",
-        params: { a: 2, b: 2 },
-      } as any);
-
-      await Promise.all([promise1, promise2]);
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      // Should have received both responses
-      expect(messages1.length).toBe(2);
-      expect(messages1).toContainEqual(expect.objectContaining({ id: 1, result: 2 }));
-      expect(messages1).toContainEqual(expect.objectContaining({ id: 1, result: 4 }));
-
-      await broker1.stop();
-    });
-
     it("should handle sequential requests with correct ordering", async () => {
       const lockName = getLockName();
       const broker1 = new MultiTabWorkerBroker(lockName, makeWorker);
@@ -1095,7 +1059,7 @@ describe("MultiTabWorkerBroker", () => {
 
       expect(broker.isLeader).toBe(true);
 
-      broker.dispose();
+      await broker.stop();
 
       // Give time for cleanup
       await new Promise((resolve) => setTimeout(resolve, 10));

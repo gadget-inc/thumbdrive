@@ -38,27 +38,29 @@ export class MultiTabWorkerBroker {
   private workerReadyResolver: (() => void) | null = null;
   // Map rewritten JSONRPC IDs back to original IDs
   private rewrittenIdMap = new Map<string, string | number>();
-  // Sequence number to ensure each rewritten ID is unique even if original IDs are reused
-  private rewriteSequence = 0;
   // Track all active connections (reader/writer pairs)
   private connections = new Map<string, { reader: MultiTabMessageReader; writer: MultiTabMessageWriter }>();
   private nextConnectionId = 0;
+  private shouldDebug = false;
 
   constructor(
     private readonly lockName: string,
     private readonly makeWorker: () => Worker | Promise<Worker>,
-    options?: { timeout?: number; onStateChange?: (state: { isLeader: boolean }) => void }
+    options?: { timeout?: number; onStateChange?: (state: { isLeader: boolean }) => void; debug?: boolean }
   ) {
     this.brokerId = generateBrokerId();
     this.timeout = options?.timeout ?? 20_000;
     this.onStateChange = options?.onStateChange;
+    this.shouldDebug = options?.debug ?? false;
   }
 
   /** Central debug logging function */
   private debug(message: string, ...args: any[]): void {
-    const role = this.isLeader ? "LEADER" : "FOLLOWER";
-    const prefix = `[MTB:${this.brokerId.slice(0, 20)}:${role}]`;
-    console.debug(prefix, message, ...args);
+    if (this.shouldDebug) {
+      const role = this.isLeader ? "LEADER" : "FOLLOWER";
+      const prefix = `[MTB:${this.brokerId.slice(0, 20)}:${role}]`;
+      console.debug(prefix, message, ...args);
+    }
   }
 
   /** Central error logging function */
@@ -158,8 +160,10 @@ export class MultiTabWorkerBroker {
     if (!acquiredLock) {
       // We're a follower - the leader exists elsewhere
       this.isLeader = false;
+
       // Set up abort controller for the follower's lock request
       this.lockAbortController = new AbortController();
+
       // Try to acquire the lock in the background for failover
       this.waitForLockAndBecomeLeader();
 
@@ -241,12 +245,11 @@ export class MultiTabWorkerBroker {
   /** Rewrite a JSONRPC ID to make it globally unique */
   private rewriteId(originalId: string | number): string {
     // Include a sequence number to handle ID reuse
-    const rewrittenId = `${this.brokerId}:${this.rewriteSequence++}:${originalId}`;
+    const rewrittenId = `${this.brokerId}:${originalId}`;
     this.rewrittenIdMap.set(rewrittenId, originalId);
     return rewrittenId;
   }
 
-  /** Un-rewrite a JSONRPC ID back to its original form */
   private unrewriteId(rewrittenId: string | number): { originalId: string | number; isOurs: boolean } {
     // Check if this ID is one of ours
     if (typeof rewrittenId === "string" && rewrittenId.startsWith(`${this.brokerId}:`)) {
@@ -259,7 +262,6 @@ export class MultiTabWorkerBroker {
     return { originalId: rewrittenId, isOurs: false };
   }
 
-  /** Rewrite message IDs if present */
   private rewriteMessage(message: Message): Message {
     // Only rewrite IDs for client->worker requests (messages with a method)
     // Responses (no method) must keep the original ID so the worker can match them
@@ -276,7 +278,6 @@ export class MultiTabWorkerBroker {
     return message;
   }
 
-  /** Un-rewrite message IDs if present and they belong to us */
   private unrewriteMessage(message: Message): { message: Message; isOurs: boolean } {
     if (message && typeof message === "object" && "id" in message && message.id !== undefined) {
       const { originalId, isOurs } = this.unrewriteId(message.id as string | number);
@@ -323,14 +324,12 @@ export class MultiTabWorkerBroker {
     }
   }
 
-  /** Emit a message to all active connections */
   private emitToAllConnections(message: Message): void {
     for (const { reader } of this.connections.values()) {
       reader._emitMessage(message);
     }
   }
 
-  /** Emit an error to all active connections */
   private emitErrorToAllConnections(error: Error): void {
     for (const { reader, writer } of this.connections.values()) {
       reader._emitError(error);
@@ -338,7 +337,6 @@ export class MultiTabWorkerBroker {
     }
   }
 
-  /** Emit close event to all active connections */
   private emitCloseToAllConnections(): void {
     for (const { reader, writer } of this.connections.values()) {
       reader._emitClose();
@@ -512,11 +510,6 @@ export class MultiTabWorkerBroker {
       this.onStateChange?.({ isLeader: false });
     }
   }
-
-  /** Dispose the broker */
-  dispose(): void {
-    void this.stop();
-  }
 }
 
 class MultiTabMessageReader implements MessageReader {
@@ -550,7 +543,6 @@ class MultiTabMessageReader implements MessageReader {
     return disposable;
   }
 
-  /** Internal method to emit a message to all listeners */
   _emitMessage(message: Message): void {
     if (!this.disposed) {
       if (this.hasListener) {
@@ -566,14 +558,12 @@ class MultiTabMessageReader implements MessageReader {
     }
   }
 
-  /** Internal method to emit an error to all listeners */
   _emitError(error: Error): void {
     if (!this.disposed) {
       this.errorEmitter.fire(error);
     }
   }
 
-  /** Internal method to emit close event to all listeners */
   _emitClose(): void {
     if (!this.disposed) {
       this.closeEmitter.fire();
@@ -621,19 +611,16 @@ class MultiTabMessageWriter implements MessageWriter {
     // Not needed for broker communication
   }
 
-  /** Internal method to set the write handler */
   _setWriteHandler(handler: (message: Message) => Promise<void>): void {
     this.writeHandler = handler;
   }
 
-  /** Internal method to emit an error to all listeners */
   _emitError(error: Error): void {
     if (!this.disposed) {
       this.errorEmitter.fire([error, undefined, undefined]);
     }
   }
 
-  /** Internal method to emit close event to all listeners */
   _emitClose(): void {
     if (!this.disposed) {
       this.closeEmitter.fire();
