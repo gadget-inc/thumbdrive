@@ -1,6 +1,6 @@
 {
   "name": "thumbdrive",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "An OPFS wrapper offering sync access and multi-tab support",
   "type": "module",
   "main": "dist/index.js",
