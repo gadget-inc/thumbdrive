@@ -29,8 +29,11 @@ const broker = new MultiTabWorkerBroker("opfs-worker-lock", async () => {
   return worker;
 });
 
-// Create JSON-RPC connection using the broker's reader and writer directly
-const connection = createMessageConnection(broker.reader, broker.writer);
+// Create a connection from the broker
+const brokerConnection = broker.createConnection();
+
+// Create JSON-RPC connection using the connection's reader and writer
+const connection = createMessageConnection(brokerConnection.reader, brokerConnection.writer);
 
 let started = false;
 
@@ -65,6 +68,7 @@ window.thumbdriveTest = {
       await connection.sendRequest(ShutdownRequest);
       await broker.stop();
       connection.dispose();
+      brokerConnection.dispose();
       started = false;
     }
   },

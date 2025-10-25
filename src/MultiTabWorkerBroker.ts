@@ -1,12 +1,16 @@
 import { Disposable, Event, Emitter, MessageReader, MessageWriter, DataCallback, PartialMessageInfo, Message } from "vscode-jsonrpc";
 
+function generateBrokerId(): string {
+  return `broker-${Date.now()}-${Math.random().toString(36).substring(2, 15)}`;
+}
+
 type BrokerMessage =
   | { type: "worker-message"; message: Message }
   | { type: "worker-request"; id: string; message: Message }
   | { type: "worker-response"; id: string; message: Message };
 
 export class MultiTabWorkerBrokerError extends Error {
-  constructor(message: string, readonly) {
+  constructor(message: string, readonly details?: Record<string, unknown>) {
     super(message);
     this.name = "MultiTabWorkerBrokerError";
   }
@@ -18,25 +22,80 @@ export class MultiTabWorkerBrokerError extends Error {
  */
 export class MultiTabWorkerBroker {
   isLeader = false;
-  reader = new MultiTabMessageReader();
-  writer = new MultiTabMessageWriter();
 
+  private readonly brokerId: string;
   private broadcastChannel: BroadcastChannel | null = null;
   private worker: Worker | null = null;
-  private lockAbortController: AbortController | null = null;
+  private lockAbortController = new AbortController();
   private pendingRequests = new Map<string, { resolve: (message: Message) => void; reject: (error: Error) => void }>();
   private nextRequestId = 0;
   private started = false;
   private timeout: number;
   private onStateChange?: (state: { isLeader: boolean }) => void;
+  // Queue of worker requests received while leader is booting the worker
+  private leaderRequestQueue: Array<{ id: string; message: Message }> = [];
+  private workerReadyPromise: Promise<void> | null = null;
+  private workerReadyResolver: (() => void) | null = null;
+  // Map rewritten JSONRPC IDs back to original IDs
+  private rewrittenIdMap = new Map<string, string | number>();
+  // Sequence number to ensure each rewritten ID is unique even if original IDs are reused
+  private rewriteSequence = 0;
+  // Track all active connections (reader/writer pairs)
+  private connections = new Map<string, { reader: MultiTabMessageReader; writer: MultiTabMessageWriter }>();
+  private nextConnectionId = 0;
 
   constructor(
     private readonly lockName: string,
     private readonly makeWorker: () => Worker | Promise<Worker>,
     options?: { timeout?: number; onStateChange?: (state: { isLeader: boolean }) => void }
   ) {
+    this.brokerId = generateBrokerId();
     this.timeout = options?.timeout ?? 20_000;
     this.onStateChange = options?.onStateChange;
+  }
+
+  /** Central debug logging function */
+  private debug(message: string, ...args: any[]): void {
+    const role = this.isLeader ? "LEADER" : "FOLLOWER";
+    const prefix = `[MTB:${this.brokerId.slice(0, 20)}:${role}]`;
+    console.debug(prefix, message, ...args);
+  }
+
+  /** Central error logging function */
+  private error(message: string, ...args: any[]): void {
+    const role = this.isLeader ? "LEADER" : "FOLLOWER";
+    const prefix = `[MTB:${this.brokerId.slice(0, 20)}:${role}]`;
+    console.error(prefix, message, ...args);
+  }
+
+  /** Create a new connection with independent reader and writer */
+  createConnection(): { reader: MessageReader; writer: MessageWriter; dispose: () => void } {
+    const connectionId = String(this.nextConnectionId++);
+    const reader = new MultiTabMessageReader();
+    const writer = new MultiTabMessageWriter();
+
+    // Set up the write handler for this connection
+    writer._setWriteHandler(async (message: Message) => {
+      await this.sendMessage(message);
+    });
+
+    // Track this connection
+    this.connections.set(connectionId, { reader, writer });
+
+    this.debug(`createConnection: Created connection ${connectionId}`);
+
+    // Return disposal function
+    const dispose = () => {
+      this.debug(`Connection ${connectionId} disposed`);
+      const conn = this.connections.get(connectionId);
+      if (conn) {
+        conn.reader.dispose();
+        conn.writer.dispose();
+        this.connections.delete(connectionId);
+      }
+    };
+
+    return { reader, writer, dispose };
   }
 
   /** Start the broker and attempt to acquire leadership */
@@ -46,10 +105,8 @@ export class MultiTabWorkerBroker {
     }
     this.started = true;
 
-    // Set up the write handler
-    this.writer._setWriteHandler(async (message: Message) => {
-      await this.sendMessage(message);
-    });
+    // Create a new AbortController for this start cycle
+    this.lockAbortController = new AbortController();
 
     // Set up broadcast channel for inter-tab communication
     this.broadcastChannel = new BroadcastChannel(this.lockName);
@@ -57,6 +114,7 @@ export class MultiTabWorkerBroker {
 
     // Try to acquire the lock and become leader - wait until we know our role
     await this.tryAcquireLock();
+    this.debug(`Broker started, isLeader=${this.isLeader}`);
   }
 
   private async tryAcquireLock(): Promise<void> {
@@ -79,9 +137,6 @@ export class MultiTabWorkerBroker {
           outcomeKnown(false);
           return false;
         }
-
-        // We have the lock! Set up abort controller now
-        this.lockAbortController = new AbortController();
 
         // Become the leader and start the worker
         await this.becomeLeader();
@@ -133,44 +188,168 @@ export class MultiTabWorkerBroker {
       .catch((error) => {
         // Lock request was aborted or failed
         if (error.name !== "AbortError") {
-          console.error("Lock acquisition failed:", error);
-          this.reader._emitError(error instanceof Error ? error : new Error(String(error)));
+          this.error(`Lock acquisition failed:`, error);
+          this.emitErrorToAllConnections(error instanceof Error ? error : new Error(String(error)));
         }
       });
   }
 
   private async becomeLeader(): Promise<void> {
+    this.debug(`Becoming leader...`);
     this.isLeader = true;
 
     // Create and start the worker
+    // Set up a promise to signal when the worker is fully ready
+    this.workerReadyPromise = new Promise<void>((resolve) => {
+      this.workerReadyResolver = resolve;
+    });
     this.worker = await this.makeWorker();
-    this.worker.addEventListener("message", this.handleWorkerMessage.bind(this));
-    this.worker.addEventListener("error", this.handleWorkerError.bind(this));
+
+    // Set up event listeners
+    const messageHandler = (event: MessageEvent) => {
+      this.handleWorkerMessage(event);
+    };
+    const errorHandler = (event: ErrorEvent) => {
+      this.handleWorkerError(event);
+    };
+
+    this.worker.addEventListener("message", messageHandler);
+    this.worker.addEventListener("error", errorHandler);
+
+    this.debug(`Leader ready with worker`);
 
     // Notify state change
     this.onStateChange?.({ isLeader: this.isLeader });
+
+    // Drain any queued follower requests that arrived while booting
+    if (this.leaderRequestQueue.length > 0 && this.worker && this.broadcastChannel) {
+      const queued = this.leaderRequestQueue.splice(0, this.leaderRequestQueue.length);
+      for (const { id, message } of queued) {
+        this.worker.postMessage(message);
+        const response: BrokerMessage = { type: "worker-response", id, message };
+        this.broadcastChannel.postMessage(response);
+      }
+    }
+
+    // Signal readiness to any pending local sends
+    if (this.workerReadyResolver) {
+      this.workerReadyResolver();
+      this.workerReadyResolver = null;
+    }
+  }
+
+  /** Rewrite a JSONRPC ID to make it globally unique */
+  private rewriteId(originalId: string | number): string {
+    // Include a sequence number to handle ID reuse
+    const rewrittenId = `${this.brokerId}:${this.rewriteSequence++}:${originalId}`;
+    this.rewrittenIdMap.set(rewrittenId, originalId);
+    return rewrittenId;
+  }
+
+  /** Un-rewrite a JSONRPC ID back to its original form */
+  private unrewriteId(rewrittenId: string | number): { originalId: string | number; isOurs: boolean } {
+    // Check if this ID is one of ours
+    if (typeof rewrittenId === "string" && rewrittenId.startsWith(`${this.brokerId}:`)) {
+      const originalId = this.rewrittenIdMap.get(rewrittenId);
+      if (originalId !== undefined) {
+        this.rewrittenIdMap.delete(rewrittenId);
+        return { originalId, isOurs: true };
+      }
+    }
+    return { originalId: rewrittenId, isOurs: false };
+  }
+
+  /** Rewrite message IDs if present */
+  private rewriteMessage(message: Message): Message {
+    // Only rewrite IDs for client->worker requests (messages with a method)
+    // Responses (no method) must keep the original ID so the worker can match them
+    if (
+      message &&
+      typeof message === "object" &&
+      "method" in (message as any) &&
+      (message as any).method &&
+      "id" in message &&
+      (message as any).id !== undefined
+    ) {
+      return { ...(message as any), id: this.rewriteId((message as any).id as string | number) } as Message;
+    }
+    return message;
+  }
+
+  /** Un-rewrite message IDs if present and they belong to us */
+  private unrewriteMessage(message: Message): { message: Message; isOurs: boolean } {
+    if (message && typeof message === "object" && "id" in message && message.id !== undefined) {
+      const { originalId, isOurs } = this.unrewriteId(message.id as string | number);
+      return { message: { ...(message as any), id: originalId } as Message, isOurs };
+    }
+    // Messages without IDs (notifications) are broadcast to everyone
+    return { message, isOurs: true };
   }
 
   private handleWorkerMessage(event: MessageEvent): void {
     const message = event.data as Message;
 
-    // Emit to local listeners
-    this.reader._emitMessage(message);
+    // If the worker is initiating a request/notification (method present), always deliver locally.
+    if (message && typeof message === "object" && "method" in (message as any) && (message as any).method) {
+      const isNotification = (message as any).id === undefined;
+      this.emitToAllConnections(message);
 
-    // Broadcast to other tabs
+      // Broadcast only notifications to followers so they can observe logs/telemetry, etc.
+      if (isNotification && this.broadcastChannel && this.isLeader) {
+        const brokerMessage: BrokerMessage = { type: "worker-message", message };
+        this.broadcastChannel.postMessage(brokerMessage);
+      }
+      return;
+    }
+
+    // Else it's a response to a prior request; route to the correct tab based on rewritten ID
+    const { message: unrewrittenMessage, isOurs } = this.unrewriteMessage(message);
+    if (isOurs) {
+      this.emitToAllConnections(unrewrittenMessage);
+    } else {
+      // If the response ID is not a rewritten broker ID (e.g., numeric or plain string),
+      // it's most likely intended for the leader (e.g., handshake done outside broker).
+      const rawId = (message as any)?.id;
+      const isRewrittenId = typeof rawId === "string" && rawId.startsWith("broker-");
+      if (!isRewrittenId) {
+        this.emitToAllConnections(message);
+      }
+    }
+
+    // Always broadcast responses so followers can pick up their own replies
     if (this.broadcastChannel && this.isLeader) {
-      const brokerMessage: BrokerMessage = {
-        type: "worker-message",
-        message,
-      };
+      const brokerMessage: BrokerMessage = { type: "worker-message", message };
       this.broadcastChannel.postMessage(brokerMessage);
+    }
+  }
+
+  /** Emit a message to all active connections */
+  private emitToAllConnections(message: Message): void {
+    for (const { reader } of this.connections.values()) {
+      reader._emitMessage(message);
+    }
+  }
+
+  /** Emit an error to all active connections */
+  private emitErrorToAllConnections(error: Error): void {
+    for (const { reader, writer } of this.connections.values()) {
+      reader._emitError(error);
+      writer._emitError(error);
+    }
+  }
+
+  /** Emit close event to all active connections */
+  private emitCloseToAllConnections(): void {
+    for (const { reader, writer } of this.connections.values()) {
+      reader._emitClose();
+      writer._emitClose();
     }
   }
 
   private handleWorkerError(event: ErrorEvent): void {
     const error = new Error(event.message || "Worker error");
-    this.reader._emitError(error);
-    this.writer._emitError(error);
+    this.error(`Worker error:`, error, event);
+    this.emitErrorToAllConnections(error);
   }
 
   private handleBroadcastMessage(event: MessageEvent): void {
@@ -179,19 +358,28 @@ export class MultiTabWorkerBroker {
     if (brokerMessage.type === "worker-message") {
       // Message from the leader's worker
       if (!this.isLeader) {
-        this.reader._emitMessage(brokerMessage.message);
+        // Un-rewrite the message and only emit if it's for us
+        const { message: unrewrittenMessage, isOurs } = this.unrewriteMessage(brokerMessage.message);
+        if (isOurs) {
+          this.emitToAllConnections(unrewrittenMessage);
+        }
       }
     } else if (brokerMessage.type === "worker-request") {
       // A follower is requesting us to send a message to the worker
-      if (this.isLeader && this.worker) {
-        this.worker.postMessage(brokerMessage.message);
-        // Send acknowledgment back
-        const response: BrokerMessage = {
-          type: "worker-response",
-          id: brokerMessage.id,
-          message: brokerMessage.message,
-        };
-        this.broadcastChannel!.postMessage(response);
+      if (this.isLeader) {
+        if (this.worker) {
+          this.worker.postMessage(brokerMessage.message);
+          // Send acknowledgment back
+          const response: BrokerMessage = {
+            type: "worker-response",
+            id: brokerMessage.id,
+            message: brokerMessage.message,
+          };
+          this.broadcastChannel!.postMessage(response);
+        } else {
+          // Worker not ready yet; queue the request until worker is available
+          this.leaderRequestQueue.push({ id: brokerMessage.id, message: brokerMessage.message });
+        }
       }
     } else if (brokerMessage.type === "worker-response") {
       // Response to our request
@@ -204,9 +392,28 @@ export class MultiTabWorkerBroker {
   }
 
   private async sendMessage(message: Message): Promise<void> {
-    if (this.isLeader && this.worker) {
-      // We're the leader, send directly to worker
-      this.worker.postMessage(message);
+    const originalId = (message as any)?.id;
+    this.debug(`sendMessage: originalId=${originalId}`, message);
+
+    // Rewrite the message ID to make it globally unique
+    const rewrittenMessage = this.rewriteMessage(message);
+    const rewrittenId = (rewrittenMessage as any)?.id;
+
+    if (this.isLeader) {
+      // If leader but worker not ready yet, wait until ready
+      if (!this.worker) {
+        this.debug(`Leader not ready; waiting for worker to initialize`);
+        if (this.workerReadyPromise) {
+          await this.workerReadyPromise;
+        }
+      }
+      if (this.worker) {
+        this.debug(`Sending to worker with rewrittenId=${rewrittenId}`, message);
+        this.worker.postMessage(rewrittenMessage);
+        return;
+      }
+      // Fallback if still no worker (should not happen): broadcast as follower
+      this.debug(`Worker still not available after wait; falling back to broadcast`);
     } else {
       // We're a follower, send via broadcast channel to leader
       if (!this.broadcastChannel) {
@@ -214,10 +421,12 @@ export class MultiTabWorkerBroker {
       }
 
       const requestId = String(this.nextRequestId++);
+      this.debug(`Sending worker-request: brokerRequestId=${requestId}, rewrittenId=${rewrittenId}`, message);
+
       const request: BrokerMessage = {
         type: "worker-request",
         id: requestId,
-        message,
+        message: rewrittenMessage,
       };
 
       // Wait for response from leader
@@ -259,7 +468,6 @@ export class MultiTabWorkerBroker {
     // Release the lock
     if (this.lockAbortController) {
       this.lockAbortController.abort();
-      this.lockAbortController = null;
     }
 
     // Terminate worker if we're the leader
@@ -280,13 +488,21 @@ export class MultiTabWorkerBroker {
     }
     this.pendingRequests.clear();
 
-    // Emit close events
-    this.reader._emitClose();
-    this.writer._emitClose();
+    // Emit close events to all connections
+    this.emitCloseToAllConnections();
 
-    // Dispose reader and writer
-    this.reader.dispose();
-    this.writer.dispose();
+    // Dispose all connections
+    for (const { reader, writer } of this.connections.values()) {
+      reader.dispose();
+      writer.dispose();
+    }
+    this.connections.clear();
+
+    // Reset worker state
+    this.workerReadyPromise = null;
+    this.workerReadyResolver = null;
+    this.leaderRequestQueue = [];
+    this.rewrittenIdMap.clear();
 
     const wasLeader = this.isLeader;
     this.isLeader = false;
@@ -309,21 +525,44 @@ class MultiTabMessageReader implements MessageReader {
   private partialMessageEmitter = new Emitter<PartialMessageInfo>();
   private messageEmitter = new Emitter<Message>();
   private disposed = false;
+  private hasListener = false;
+  private queuedMessages: Message[] = [];
+  private static readonly MAX_QUEUE = 1000;
 
   onError: Event<Error> = this.errorEmitter.event;
   onClose: Event<void> = this.closeEmitter.event;
   onPartialMessage: Event<PartialMessageInfo> = this.partialMessageEmitter.event;
 
   listen(callback: DataCallback): Disposable {
-    return this.messageEmitter.event((message) => {
+    const disposable = this.messageEmitter.event((message) => {
       callback(message as Message);
     });
+    if (!this.hasListener) {
+      this.hasListener = true;
+      // Flush any queued messages in order now that a listener is attached
+      if (this.queuedMessages.length > 0) {
+        const toFlush = this.queuedMessages.splice(0, this.queuedMessages.length);
+        for (const msg of toFlush) {
+          this.messageEmitter.fire(msg);
+        }
+      }
+    }
+    return disposable;
   }
 
   /** Internal method to emit a message to all listeners */
   _emitMessage(message: Message): void {
     if (!this.disposed) {
-      this.messageEmitter.fire(message);
+      if (this.hasListener) {
+        this.messageEmitter.fire(message);
+      } else {
+        // Queue until a listener is attached
+        if (this.queuedMessages.length >= MultiTabMessageReader.MAX_QUEUE) {
+          // Drop oldest to prevent unbounded growth
+          this.queuedMessages.shift();
+        }
+        this.queuedMessages.push(message);
+      }
     }
   }
 
@@ -348,6 +587,7 @@ class MultiTabMessageReader implements MessageReader {
       this.closeEmitter.dispose();
       this.partialMessageEmitter.dispose();
       this.messageEmitter.dispose();
+      this.queuedMessages = [];
     }
   }
 }
