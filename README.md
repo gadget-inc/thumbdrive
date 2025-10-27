@@ -50,17 +50,10 @@ const connection = createMessageConnection(reader, writer);
 connection.sendRequest("initialize", { rootUri: "/project" });
 ```
 
-## Installation
+# Credits
 
-```bash
-npm install thumbdrive
-```
-
-## Requirements
-
-- Modern browser with OPFS sync access support (Chrome 102+, Edge 102+)
-- Web Workers
-- SharedArrayBuffer support (requires appropriate CORS headers for multi-tab coordination)
+- Roy Hashimoto pioneered a lot of this approach when working to get SQLite running in the browser. See https://github.com/rhashimoto/wa-sqlite/discussions/81 for the seed of this idea
+- Notion documented their similar approach here: https://www.notion.com/blog/how-we-sped-up-notion-in-the-browser-with-wasm-sqlite -- this is an open-source implementation of the same one-worker-among-many tabs approach!
 
 ## License
 
