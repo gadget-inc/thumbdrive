@@ -40,7 +40,6 @@
     "path-browserify": "^1.0.1",
     "playwright": "1.54.1",
     "prettier": "^2.8.1",
-    "tinybench": "^2.6.0",
     "tsx": "^4.19.2",
     "typescript": "^5.8.3",
     "vite": "^7.1.12",
