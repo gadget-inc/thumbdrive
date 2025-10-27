@@ -201,8 +201,9 @@ describe("MultiTabWorkerBroker", () => {
       // Teardown the leader
       await broker1.stop();
 
-      // Wait for follower to become leader
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      // Wait for follower to become leader and initialize its worker
+      // Need more time since the worker needs to be created and initialized
+      await new Promise((resolve) => setTimeout(resolve, 150));
       expect(broker2.isLeader).toBe(true);
 
       // Verify new leader can communicate

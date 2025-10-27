@@ -42,6 +42,8 @@ export class MultiTabWorkerBroker {
   private connections = new Map<string, { reader: MultiTabMessageReader; writer: MultiTabMessageWriter }>();
   private nextConnectionId = 0;
   private shouldDebug = false;
+  // Track the active lock request promise to ensure proper cleanup
+  private activeLockPromise: Promise<any> | null = null;
 
   constructor(
     private readonly lockName: string,
@@ -130,8 +132,8 @@ export class MultiTabWorkerBroker {
     // First, try to acquire the lock immediately with ifAvailable
     // This allows us to quickly determine if we can be leader or if another tab already has the lock
     // If we can acquire the lock, we are the leader, and we return promptly from start
-    // Note: not awaited, because this won't ever return if we do acquire the lock as the leader
-    navigator.locks
+    // Store the lock promise so we can wait for it to complete during stop()
+    this.activeLockPromise = navigator.locks
       .request(this.lockName, { ifAvailable: true }, async (lock) => {
         if (lock === null) {
           // Lock is not available - another tab is the leader
@@ -175,8 +177,8 @@ export class MultiTabWorkerBroker {
   private waitForLockAndBecomeLeader(): void {
     // Wait indefinitely to acquire the lock for failover
     // This will block until the current leader releases the lock
-    // Note: not awaited, because this won't ever return if we do acquire the lock and become the leader
-    navigator.locks
+    // Store the lock promise so we can wait for it to complete during stop()
+    this.activeLockPromise = navigator.locks
       .request(this.lockName, { signal: this.lockAbortController!.signal }, async () => {
         // We got the lock! Become the leader and start the worker
         await this.becomeLeader();
@@ -466,6 +468,21 @@ export class MultiTabWorkerBroker {
     // Release the lock
     if (this.lockAbortController) {
       this.lockAbortController.abort();
+    }
+
+    // Wait for the lock to be fully released before proceeding
+    // This is critical to ensure a new broker can immediately acquire the same lock
+    const lockPromiseToAwait = this.activeLockPromise;
+    if (lockPromiseToAwait) {
+      try {
+        await lockPromiseToAwait;
+      } catch (error) {
+        // Ignore abort errors which are expected during stop
+        if (error && (error as any).name !== "AbortError") {
+          this.error("Error while waiting for lock release:", error);
+        }
+      }
+      this.activeLockPromise = null;
     }
 
     // Terminate worker if we're the leader

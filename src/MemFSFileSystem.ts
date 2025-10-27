@@ -1,6 +1,6 @@
 import { fs, vol } from "memfs";
 import path from "path";
-import { VirtualFileSystem } from "../src/VirtualFileSystem";
+import { VirtualFileSystem } from "./VirtualFileSystem.js";
 
 // Memfs implementation
 export class MemfsFileSystem implements VirtualFileSystem {

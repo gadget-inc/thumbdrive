@@ -1,7 +1,7 @@
 import { test, describe, beforeEach, afterEach, expect } from "vitest";
 import { vol } from "memfs";
 import "opfs-mock";
-import { MemfsFileSystem } from "./MemFSFileSystem";
+import { MemfsFileSystem } from "../src/MemFSFileSystem";
 import { SyncOPFSFileSystem } from "../src/SyncOPFSFileSystem";
 import { VirtualFileSystem } from "../src/VirtualFileSystem";
 

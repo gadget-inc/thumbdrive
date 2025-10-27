@@ -11,6 +11,9 @@ importers:
 
   .:
     dependencies:
+      memfs:
+        specifier: ^4.49.0
+        version: 4.49.0
       vscode-jsonrpc:
         specifier: ^8.2.1
         version: 8.2.1
@@ -51,9 +54,6 @@ importers:
       lodash:
         specifier: ^4.17.21
         version: 4.17.21
-      memfs:
-        specifier: ^4.49.0
-        version: 4.49.0
       opfs-mock:
         specifier: ^2.4.0
         version: 2.4.0
