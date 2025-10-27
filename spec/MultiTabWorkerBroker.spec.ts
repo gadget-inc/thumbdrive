@@ -188,8 +188,20 @@ describe("MultiTabWorkerBroker", () => {
       await broker1.start();
       expect(broker1.isLeader).toBe(true);
 
-      // Start second broker as follower
-      const broker2 = new MultiTabWorkerBroker(lockName, makeWorker);
+      // Setup promise to wait for broker2 to become leader
+      let broker2BecameLeader: () => void;
+      const broker2LeaderPromise = new Promise<void>((resolve) => {
+        broker2BecameLeader = resolve;
+      });
+
+      // Start second broker as follower with state change callback
+      const broker2 = new MultiTabWorkerBroker(lockName, makeWorker, {
+        onStateChange: ({ isLeader }) => {
+          if (isLeader) {
+            broker2BecameLeader();
+          }
+        },
+      });
       await broker2.start();
       expect(broker2.isLeader).toBe(false);
 
@@ -202,8 +214,9 @@ describe("MultiTabWorkerBroker", () => {
       await broker1.stop();
 
       // Wait for follower to become leader and initialize its worker
-      // Need more time since the worker needs to be created and initialized
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      await broker2LeaderPromise;
+      // Give a bit more time for worker to be fully ready
+      await new Promise((resolve) => setTimeout(resolve, 50));
       expect(broker2.isLeader).toBe(true);
 
       // Verify new leader can communicate
