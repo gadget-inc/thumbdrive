@@ -4,11 +4,15 @@ Browser infrastructure for reducing memory usage in web-based code editors and l
 
 ## Problem
 
-Browser tabs crash from memory pressure when running TypeScript language servers that hold large codebases (including `.d.ts` files) in memory. Browsers kill tabs based on total memory usage across all open tabs, making multi-tab workflows particularly problematic.
+If you want to store a lot of files client side, say to power a language service or SQLite database or similar, storing all your files in memory occupies a lot of memory! We have disks for just this purpose and [OPFS](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system) is a helpful Web API for doing just that.
+
+If you have a synchronous client side use case however, like say a TypeScript language service or a VFS for SQLite, OPFS doesn't quite fit the bill, as it's access patterns are all async. You can do synchronous reads and writes once you have a file handle open, but you can't open new files synchronously.
+
+Worse yet, once you have that file handle open in one tab, you can't open it in any other tabs due to OPFS' locking semantics!
 
 ## Solution
 
-Two primitives that work together to minimize memory usage:
+Two primitives that work together to allow sync FS usage among many tabs:
 
 ### `SyncOPFSFileSystem`
 
@@ -30,9 +34,7 @@ fs.existsSync("/src/index.ts"); // true
 
 ### `MultiTabWorkerBroker`
 
-Coordinates multiple browser tabs to share a single web worker, dramatically reducing per-tab memory overhead.
-
-**Why it's needed:** Each TypeScript LSP worker consumes ~1GB+ of memory for type information and parsed files. With multiple tabs, this multiplies quickly. The broker uses the Web Locks API to elect a leader tab that runs the worker, while follower tabs proxy messages via BroadcastChannel. When the leader closes, a follower automatically takes over and starts a new worker.
+Coordinates multiple browser tabs to share a single web worker that owns the FS. Instead of each tab opening its own filesystem (and using the hunk of memory per tab), we instead elect one tab as the leader tab, and have it's `Worker` be the exclusive way in or out of the FS. The main thread that owns that worker can talk directly to it, and any other tabs can talk to the leader worker via a `BroadcastChannel`. When the leader tab closes, one of the other tabs gets promoted to leader, and starts its own `Worker` that then becomes the single owner.
 
 ```typescript
 import { MultiTabWorkerBroker } from "thumbdrive";
