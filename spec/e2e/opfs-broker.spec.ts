@@ -1,5 +1,19 @@
 import { test, expect, type Page } from "@playwright/test";
 
+// Type declarations for the test API exposed by main.ts
+declare global {
+  interface Window {
+    thumbdriveTest: {
+      start: () => Promise<void>;
+      shutdown: () => Promise<void>;
+      isLeader: () => boolean;
+      writeFile: (p: string, s: string) => Promise<void>;
+      readFile: (p: string) => Promise<string>;
+      exists: (p: string) => Promise<boolean>;
+    };
+  }
+}
+
 function url(ns: string, arena: string) {
   return `/testapp/index.html?ns=${encodeURIComponent(ns)}&arena=${encodeURIComponent(arena)}`;
 }
@@ -17,14 +31,34 @@ async function setupPage(page: Page) {
 }
 
 async function waitForReady(page: Page) {
+  // Wait for the page to be fully loaded and stable
+  await page.waitForLoadState("domcontentloaded");
+
   // Wait for the page to load and thumbdriveTest to be available
   await page.waitForFunction(() => window.thumbdriveTest !== undefined, { timeout: 10000 });
 }
 
 async function startCandidate(page: Page) {
-  await page.evaluate(() => window.thumbdriveTest.start());
-  // Give the worker time to initialize
-  await page.waitForTimeout(100);
+  // Retry logic to handle transient execution context issues
+  let lastError: Error | undefined;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await page.evaluate(() => window.thumbdriveTest.start());
+      // Give the worker time to initialize
+      await page.waitForTimeout(100);
+      return; // Success
+    } catch (error) {
+      lastError = error as Error;
+      if (error instanceof Error && error.message.includes("Execution context was destroyed")) {
+        // Wait and retry
+        await page.waitForTimeout(100);
+        continue;
+      }
+      // Re-throw if it's not an execution context error
+      throw error;
+    }
+  }
+  throw lastError;
 }
 
 async function shutdownLeader(page: Page) {
