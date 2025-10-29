@@ -9,6 +9,26 @@ describe("MultiTabWorkerBroker", () => {
   let testCounter = 0;
   let getLockName: () => string;
 
+  // Helper function to wait for a condition with retry logic
+  async function waitFor<T>(
+    fn: () => T | Promise<T>,
+    predicate: (value: T) => boolean,
+    options: { timeout?: number; interval?: number; message?: string } = {}
+  ): Promise<T> {
+    const { timeout = 5000, interval = 10, message = "Condition not met within timeout" } = options;
+    const startTime = Date.now();
+
+    while (Date.now() - startTime < timeout) {
+      const value = await fn();
+      if (predicate(value)) {
+        return value;
+      }
+      await new Promise((resolve) => setTimeout(resolve, interval));
+    }
+
+    throw new Error(message);
+  }
+
   beforeEach(() => {
     // Create unique lock name for each test
     const lockName = `test-lock-${testCounter++}`;
@@ -215,8 +235,14 @@ describe("MultiTabWorkerBroker", () => {
 
       // Wait for follower to become leader and initialize its worker
       await broker2LeaderPromise;
-      // Give a bit more time for worker to be fully ready
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      // Wait for broker2 to be fully ready as leader
+      await waitFor(
+        () => broker2.isLeader,
+        (isLeader) => isLeader === true,
+        { timeout: 500, message: "Broker2 did not become leader" }
+      );
+      // Give worker additional time to be fully ready
+      await new Promise((resolve) => setTimeout(resolve, 100));
       expect(broker2.isLeader).toBe(true);
 
       // Verify new leader can communicate
@@ -226,7 +252,13 @@ describe("MultiTabWorkerBroker", () => {
         method: "echo",
         params: { promoted: true },
       } as any);
-      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // Wait for the response with retry logic
+      await waitFor(
+        () => followerMessages,
+        (msgs) => msgs.some((m) => m.id === 1 && m.result?.promoted === true),
+        { timeout: 2000, message: "Expected response from promoted leader not received" }
+      );
 
       expect(followerMessages).toContainEqual(expect.objectContaining({ id: 1, result: { promoted: true } }));
 
@@ -516,6 +548,52 @@ describe("MultiTabWorkerBroker", () => {
 
       await broker1.stop();
       await broker2.stop();
+    });
+
+    it("should let a follower send messages after leader restarts within same tab", async () => {
+      const lockName = getLockName();
+
+      // Tab A: start, stop (without awaiting), and start again (React Strict Mode pattern)
+      const leader = new MultiTabWorkerBroker(lockName, makeWorker);
+      await leader.start();
+      const stopPromise = leader.stop();
+      await leader.start();
+
+      expect(leader.isLeader).toBe(true);
+
+      // Tab B: start as follower
+      const follower = new MultiTabWorkerBroker(lockName, makeWorker, { timeout: 50 });
+      await follower.start();
+      expect(follower.isLeader).toBe(false);
+
+      const followerMessages: any[] = [];
+      const followerConnection = follower.createConnection();
+      followerConnection.reader.listen((msg) => followerMessages.push(msg));
+
+      // First request from follower should succeed (currently fails with "Broker stopped" due to concurrent stop cleanup)
+      const writePromise = followerConnection.writer.write({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "echo",
+        params: { tab: "follower" },
+      } as any);
+
+      try {
+        await expect(writePromise).resolves.toBeUndefined();
+
+        // Wait for response delivery
+        await waitFor(
+          () => followerMessages,
+          (msgs) => msgs.some((msg) => msg.id === 1 && msg.result?.tab === "follower"),
+          { timeout: 2000, message: "Follower did not receive response after leader restart" }
+        );
+
+        expect(followerMessages).toContainEqual(expect.objectContaining({ id: 1, result: { tab: "follower" } }));
+      } finally {
+        await follower.stop();
+        await leader.stop();
+        await Promise.race([stopPromise, new Promise((resolve) => setTimeout(resolve, 1000))]);
+      }
     });
 
     it("should timeout when no leader available", async () => {
@@ -1022,10 +1100,14 @@ describe("MultiTabWorkerBroker", () => {
 
       const leader = new MultiTabWorkerBroker(lockName, async () => {
         // Delay creating the worker to widen the window for queued requests
-        await new Promise((r) => setTimeout(r, 100));
+        await new Promise((r) => setTimeout(r, 200));
         return await makeSlowWorker();
       });
-      const follower = new MultiTabWorkerBroker(lockName, makeSlowWorker);
+      const follower = new MultiTabWorkerBroker(lockName, async () => {
+        // Also delay follower's worker creation to test queuing
+        await new Promise((r) => setTimeout(r, 200));
+        return await makeSlowWorker();
+      });
 
       const followerMsgs: any[] = [];
       const followerConn = follower.createConnection();
@@ -1042,7 +1124,7 @@ describe("MultiTabWorkerBroker", () => {
       // Force leader to release so follower acquires lock and begins booting
       const stopPromise = leader.stop();
       // Small delay to ensure follower's lock wait proceeds
-      await new Promise((r) => setTimeout(r, 10));
+      await new Promise((r) => setTimeout(r, 20));
       // Now, before new worker is ready, send a couple of requests
       const p1 = followerConn.writer.write({ jsonrpc: "2.0", id: 1, method: "echo", params: { during: 1 } } as any);
       const p2 = followerConn.writer.write({ jsonrpc: "2.0", id: 2, method: "echo", params: { during: 2 } } as any);
@@ -1050,7 +1132,20 @@ describe("MultiTabWorkerBroker", () => {
 
       // Give time for follower to acquire lock and broker to create worker, then for queue to drain
       await Promise.all([p1, p2]);
-      await new Promise((r) => setTimeout(r, 200));
+
+      // Wait for follower to become leader (needs more time due to 200ms worker delay)
+      await waitFor(
+        () => follower.isLeader,
+        (isLeader) => isLeader === true,
+        { timeout: 3000, message: "Follower did not become leader" }
+      );
+
+      // Wait for both responses with retry logic (allow more time for queued messages to process)
+      await waitFor(
+        () => followerMsgs,
+        (msgs) => msgs.some((m) => m.id === 1 && m.result?.during === 1) && msgs.some((m) => m.id === 2 && m.result?.during === 2),
+        { timeout: 3000, message: "Expected responses not received during leader boot" }
+      );
 
       expect(follower.isLeader).toBe(true);
       // Both responses should arrive even though they were sent while leader was booting

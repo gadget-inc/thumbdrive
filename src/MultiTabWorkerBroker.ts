@@ -22,6 +22,7 @@ export class MultiTabWorkerBrokerError extends Error {
  */
 export class MultiTabWorkerBroker {
   isLeader = false;
+  started = false;
 
   private readonly brokerId: string;
   private broadcastChannel: BroadcastChannel | null = null;
@@ -29,7 +30,6 @@ export class MultiTabWorkerBroker {
   private lockAbortController = new AbortController();
   private pendingRequests = new Map<string, { resolve: (message: Message) => void; reject: (error: Error) => void }>();
   private nextRequestId = 0;
-  private started = false;
   private timeout: number;
   private onStateChange?: (state: { isLeader: boolean }) => void;
   // Queue of worker requests received while leader is booting the worker
@@ -44,6 +44,8 @@ export class MultiTabWorkerBroker {
   private shouldDebug = false;
   // Track the active lock request promise to ensure proper cleanup
   private activeLockPromise: Promise<any> | null = null;
+  // Track an in-flight stop operation so subsequent starts wait for cleanup
+  private stopPromise: Promise<void> | null = null;
 
   constructor(
     private readonly lockName: string,
@@ -104,6 +106,9 @@ export class MultiTabWorkerBroker {
 
   /** Start the broker and attempt to acquire leadership */
   async start(): Promise<void> {
+    if (this.stopPromise) {
+      await this.stopPromise;
+    }
     if (this.started) {
       return;
     }
@@ -114,7 +119,7 @@ export class MultiTabWorkerBroker {
 
     // Set up broadcast channel for inter-tab communication
     this.broadcastChannel = new BroadcastChannel(this.lockName);
-    this.broadcastChannel.addEventListener("message", this.handleBroadcastMessage.bind(this));
+    this.broadcastChannel.addEventListener("message", this.handleBroadcastMessage);
 
     // Try to acquire the lock and become leader - wait until we know our role
     await this.tryAcquireLock();
@@ -352,7 +357,12 @@ export class MultiTabWorkerBroker {
     this.emitErrorToAllConnections(error);
   }
 
-  private handleBroadcastMessage(event: MessageEvent): void {
+  private handleBroadcastMessage = (event: MessageEvent): void => {
+    // Ignore messages if we've been stopped
+    if (!this.started) {
+      return;
+    }
+
     const brokerMessage = event.data as BrokerMessage;
 
     if (brokerMessage.type === "worker-message") {
@@ -389,7 +399,7 @@ export class MultiTabWorkerBroker {
         this.pendingRequests.delete(brokerMessage.id);
       }
     }
-  }
+  };
 
   private async sendMessage(message: Message): Promise<void> {
     const originalId = (message as any)?.id;
@@ -459,73 +469,81 @@ export class MultiTabWorkerBroker {
 
   /** Stop the broker and release all resources */
   async stop(): Promise<void> {
+    if (this.stopPromise) {
+      await this.stopPromise;
+      return;
+    }
+
     if (!this.started) {
       return;
     }
 
     this.started = false;
 
-    // Release the lock
-    if (this.lockAbortController) {
-      this.lockAbortController.abort();
-    }
-
-    // Wait for the lock to be fully released before proceeding
-    // This is critical to ensure a new broker can immediately acquire the same lock
-    const lockPromiseToAwait = this.activeLockPromise;
-    if (lockPromiseToAwait) {
-      try {
-        await lockPromiseToAwait;
-      } catch (error) {
-        // Ignore abort errors which are expected during stop
-        if (error && (error as any).name !== "AbortError") {
-          this.error("Error while waiting for lock release:", error);
-        }
+    const performStop = async () => {
+      if (this.lockAbortController) {
+        this.lockAbortController.abort();
       }
-      this.activeLockPromise = null;
-    }
 
-    // Terminate worker if we're the leader
-    if (this.worker) {
-      this.worker.terminate();
-      this.worker = null;
-    }
+      const lockPromiseToAwait = this.activeLockPromise;
+      if (lockPromiseToAwait) {
+        try {
+          await lockPromiseToAwait;
+        } catch (error) {
+          if (error && (error as any).name !== "AbortError") {
+            this.error("Error while waiting for lock release:", error as Error);
+          }
+        }
+        this.activeLockPromise = null;
+      }
 
-    // Close broadcast channel
-    if (this.broadcastChannel) {
-      this.broadcastChannel.close();
-      this.broadcastChannel = null;
-    }
+      if (this.worker) {
+        this.worker.terminate();
+        this.worker = null;
+      }
 
-    // Reject all pending requests
-    for (const [id, pending] of this.pendingRequests.entries()) {
-      pending.reject(new Error("Broker stopped"));
-    }
-    this.pendingRequests.clear();
+      const channel = this.broadcastChannel;
+      if (channel) {
+        channel.removeEventListener("message", this.handleBroadcastMessage);
+        channel.close();
+        this.broadcastChannel = null;
+      }
 
-    // Emit close events to all connections
-    this.emitCloseToAllConnections();
+      for (const [id, pending] of this.pendingRequests.entries()) {
+        pending.reject(new Error("Broker stopped"));
+      }
+      this.pendingRequests.clear();
 
-    // Dispose all connections
-    for (const { reader, writer } of this.connections.values()) {
-      reader.dispose();
-      writer.dispose();
-    }
-    this.connections.clear();
+      this.emitCloseToAllConnections();
 
-    // Reset worker state
-    this.workerReadyPromise = null;
-    this.workerReadyResolver = null;
-    this.leaderRequestQueue = [];
-    this.rewrittenIdMap.clear();
+      for (const { reader, writer } of this.connections.values()) {
+        reader.dispose();
+        writer.dispose();
+      }
+      this.connections.clear();
 
-    const wasLeader = this.isLeader;
-    this.isLeader = false;
+      this.workerReadyPromise = null;
+      this.workerReadyResolver = null;
+      this.leaderRequestQueue = [];
+      this.rewrittenIdMap.clear();
 
-    // Notify state change if we were the leader
-    if (wasLeader) {
-      this.onStateChange?.({ isLeader: false });
-    }
+      const wasLeader = this.isLeader;
+      this.isLeader = false;
+
+      if (wasLeader) {
+        this.onStateChange?.({ isLeader: false });
+      }
+    };
+
+    this.stopPromise = (async () => {
+      try {
+        await performStop();
+      } finally {
+        this.stopPromise = null;
+      }
+    })();
+
+    await this.stopPromise;
   }
 }
 
