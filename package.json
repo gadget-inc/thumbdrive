@@ -1,10 +1,19 @@
 {
   "name": "thumbdrive",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "An OPFS wrapper offering sync access and multi-tab support",
   "type": "module",
   "main": "dist/index.js",
+  "module": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "sideEffects": false,
   "repository": "gadget-inc/thumbdrive",
   "author": "Gadget Software Inc.",
   "license": "MIT",
