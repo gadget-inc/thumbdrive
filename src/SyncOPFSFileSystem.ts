@@ -363,6 +363,94 @@ export class SyncOPFSFileSystem implements VirtualFileSystem {
   private freeExtents(extents: FileExtent[]) {
     for (const e of extents) this.freeList.push({ startPage: e.startPage, pageCount: e.pageCount });
     this.coalesceFreeList();
+    this.shrinkArenaTrailingFreeSpace();
+  }
+
+  /** Shrink the arena file by truncating trailing free pages */
+  private shrinkArenaTrailingFreeSpace() {
+    if (this.freeList.length === 0) return;
+    const arenaBytes = this.arenaHandle.getSize();
+    const totalPages = Math.floor(arenaBytes / PAGE_SIZE);
+    if (totalPages === 0) return;
+
+    // The free list is sorted after coalesce — check if the last range reaches the arena end
+    const last = this.freeList[this.freeList.length - 1];
+    if (last.startPage + last.pageCount !== totalPages) return;
+
+    // Keep a minimum arena size to avoid thrashing (e.g. 1 MiB / PAGE_SIZE pages)
+    const minPages = Math.ceil((1024 * 1024) / PAGE_SIZE);
+    const reclaimablePages = last.pageCount;
+    const newTotalPages = Math.max(totalPages - reclaimablePages, minPages);
+    const pagesReclaimed = totalPages - newTotalPages;
+
+    if (pagesReclaimed <= 0) return;
+
+    this.arenaHandle.truncate(newTotalPages * PAGE_SIZE);
+
+    if (pagesReclaimed === last.pageCount) {
+      this.freeList.pop();
+    } else {
+      last.pageCount -= pagesReclaimed;
+    }
+  }
+
+  /**
+   * Full compaction: relocates all live file data to the start of the arena,
+   * eliminates fragmentation, and truncates the arena file.
+   * Call this periodically or after large batch deletions for maximum space savings.
+   */
+  gc() {
+    // Collect all live file extents in the tree
+    const liveFiles: { node: FileNode; oldExtents: FileExtent[] }[] = [];
+    const walk = (node: Node) => {
+      if (node.type === "file" && node.extents.length > 0) {
+        liveFiles.push({ node, oldExtents: node.extents.map((e) => ({ ...e })) });
+      } else if (node.type === "dir") {
+        for (const child of node.children.values()) walk(child);
+      }
+    };
+    walk(this.root);
+
+    // Sort live files by their first extent's start page for sequential reads
+    liveFiles.sort((a, b) => a.oldExtents[0].startPage - b.oldExtents[0].startPage);
+
+    // Relocate each file's data contiguously from page 0 onward
+    let nextPage = 0;
+    for (const { node, oldExtents } of liveFiles) {
+      const data = this.readFileBytes(node);
+      if (!data) continue;
+
+      const pagesNeeded = Math.ceil(node.size / PAGE_SIZE);
+      const newExtent: FileExtent = { startPage: nextPage, pageCount: pagesNeeded };
+
+      // Write data to its new location
+      this.writeBytesToExtents([newExtent], data);
+      node.extents = [newExtent];
+      nextPage += pagesNeeded;
+    }
+
+    // Rebuild free list and truncate
+    const usedPages = nextPage;
+    const minPages = Math.max(usedPages, Math.ceil((1024 * 1024) / PAGE_SIZE));
+    this.arenaHandle.truncate(minPages * PAGE_SIZE);
+    this.allocatedBytes = usedPages * PAGE_SIZE;
+
+    this.freeList = [];
+    if (minPages > usedPages) {
+      this.freeList.push({ startPage: usedPages, pageCount: minPages - usedPages });
+    }
+  }
+
+  /** Returns stats about arena usage for monitoring */
+  getStats(): { arenaBytes: number; allocatedBytes: number; freeBytes: number; freeFragments: number } {
+    const arenaBytes = this.arenaHandle.getSize();
+    const freePages = this.freeList.reduce((sum, r) => sum + r.pageCount, 0);
+    return {
+      arenaBytes,
+      allocatedBytes: this.allocatedBytes,
+      freeBytes: freePages * PAGE_SIZE,
+      freeFragments: this.freeList.length,
+    };
   }
 
   private coalesceFreeList() {

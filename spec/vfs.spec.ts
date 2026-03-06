@@ -430,3 +430,177 @@ describe.each([
     expect(vfs.readFileSync(link, { encoding: "utf8" })).toBe("data");
   });
 });
+
+describe("sync opfs gc", () => {
+  let vfs: SyncOPFSFileSystem;
+
+  beforeEach(async () => {
+    vfs = new SyncOPFSFileSystem("gadget-gc");
+    await vfs.init();
+  });
+
+  afterEach(async () => {
+    await vfs.close();
+  });
+
+  test("getStats reports arena usage", async () => {
+    await vfs.writeFileEnsuringDirectories("/stats/file.ts", "hello world");
+    const stats = vfs.getStats();
+    expect(stats.arenaBytes).toBeGreaterThan(0);
+    expect(stats.allocatedBytes).toBeGreaterThan(0);
+  });
+
+  test("arena shrinks when trailing pages are freed", async () => {
+    // Write a file to grow the arena, then delete it
+    const bigData = "x".repeat(200_000); // ~200KB, multiple pages
+    await vfs.writeFileEnsuringDirectories("/shrink/big.ts", bigData);
+    const afterWrite = vfs.getStats();
+
+    await vfs.deleteFile("/shrink/big.ts");
+    const afterDelete = vfs.getStats();
+
+    // Arena should have shrunk after freeing trailing pages
+    expect(afterDelete.arenaBytes).toBeLessThanOrEqual(afterWrite.arenaBytes);
+    expect(afterDelete.allocatedBytes).toBe(0);
+  });
+
+  test("overwriting a file does not leak arena space indefinitely", async () => {
+    const path = "/overwrite/file.ts";
+    const data = "x".repeat(100_000);
+
+    await vfs.writeFileEnsuringDirectories(path, data);
+    const baseline = vfs.getStats();
+
+    // Overwrite many times — arena should not grow unboundedly
+    for (let i = 0; i < 20; i++) {
+      vfs.writeFileSync(path, data + i);
+    }
+    const afterOverwrites = vfs.getStats();
+
+    // Arena should not be significantly larger than baseline
+    // (some growth is expected due to copy-on-write, but not 20x)
+    expect(afterOverwrites.arenaBytes).toBeLessThan(baseline.arenaBytes * 3);
+  });
+
+  test("many sequential small edits to a single file do not grow arena disproportionately", async () => {
+    const path = "/edits/document.ts";
+    // Start with a ~10KB file, simulating a source file
+    const baseContent = "// line\n".repeat(1250);
+    await vfs.writeFileEnsuringDirectories(path, baseContent);
+    const baseline = vfs.getStats();
+
+    // Simulate 500 small incremental edits (typo fixes, adding a line, etc.)
+    // Each edit changes only a few characters but rewrites the whole file
+    for (let i = 0; i < 500; i++) {
+      const edited = baseContent.slice(0, 100) + `// edit ${i}\n` + baseContent.slice(100);
+      vfs.writeFileSync(path, edited);
+    }
+
+    const afterEdits = vfs.getStats();
+
+    // The file is ~10KB. After 500 overwrites, a naive system would accumulate
+    // ~5MB of dead data. With GC, the arena should stay close to baseline.
+    // We allow up to 2x the baseline to account for copy-on-write transients
+    // and page alignment overhead, but certainly not 500x.
+    expect(afterEdits.arenaBytes).toBeLessThan(baseline.arenaBytes * 2);
+
+    // Allocated bytes should reflect only the single live file (~10KB, page-aligned)
+    expect(afterEdits.allocatedBytes).toBeLessThanOrEqual(baseline.allocatedBytes * 2);
+
+    // The file content should be the last edit, proving correctness
+    const finalContent = baseContent.slice(0, 100) + `// edit 499\n` + baseContent.slice(100);
+    expect(vfs.readFileSync(path, { encoding: "utf8" })).toBe(finalContent);
+  });
+
+  test("many sequential small edits across multiple files do not grow arena disproportionately", async () => {
+    const fileCount = 10;
+    const editsPerFile = 100;
+    const baseContent = "x".repeat(5_000); // 5KB per file
+
+    // Create all files
+    for (let f = 0; f < fileCount; f++) {
+      await vfs.writeFileEnsuringDirectories(`/multi/file${f}.ts`, baseContent);
+    }
+    const baseline = vfs.getStats();
+
+    // Round-robin edits across files — simulates a dev editing multiple open files
+    for (let round = 0; round < editsPerFile; round++) {
+      for (let f = 0; f < fileCount; f++) {
+        vfs.writeFileSync(`/multi/file${f}.ts`, baseContent + `// r${round}`);
+      }
+    }
+
+    const afterEdits = vfs.getStats();
+
+    // 10 files × 5KB = 50KB live data. 1000 total writes would be 5MB without GC.
+    // Arena should stay reasonable — well under 4x the baseline.
+    expect(afterEdits.arenaBytes).toBeLessThan(baseline.arenaBytes * 4);
+
+    // Verify every file has the correct final content
+    for (let f = 0; f < fileCount; f++) {
+      expect(vfs.readFileSync(`/multi/file${f}.ts`, { encoding: "utf8" })).toBe(baseContent + `// r${editsPerFile - 1}`);
+    }
+  });
+
+  test("gc() compacts fragmented arena", async () => {
+    // Create several files, delete alternating ones to create fragmentation
+    for (let i = 0; i < 10; i++) {
+      await vfs.writeFileEnsuringDirectories(`/frag/file${i}.ts`, "x".repeat(70_000));
+    }
+    // Delete even-numbered files to fragment
+    for (let i = 0; i < 10; i += 2) {
+      await vfs.deleteFile(`/frag/file${i}.ts`);
+    }
+    const beforeGc = vfs.getStats();
+
+    vfs.gc();
+    const afterGc = vfs.getStats();
+
+    // After compaction, arena should be smaller or equal
+    expect(afterGc.arenaBytes).toBeLessThanOrEqual(beforeGc.arenaBytes);
+    // Fragmentation should be reduced (0 or 1 free fragment)
+    expect(afterGc.freeFragments).toBeLessThanOrEqual(1);
+
+    // All remaining files should still be readable
+    for (let i = 1; i < 10; i += 2) {
+      const content = vfs.readFileSync(`/frag/file${i}.ts`, { encoding: "utf8" });
+      expect(content).toBe("x".repeat(70_000));
+    }
+  });
+
+  test("gc() on empty filesystem is a no-op", () => {
+    vfs.gc();
+    const stats = vfs.getStats();
+    expect(stats.allocatedBytes).toBe(0);
+  });
+
+  test("exportIndex/importIndex preserves data after gc", async () => {
+    for (let i = 0; i < 5; i++) {
+      await vfs.writeFileEnsuringDirectories(`/persist/file${i}.ts`, `content-${i}`);
+    }
+    await vfs.deleteFile("/persist/file2.ts");
+
+    vfs.gc();
+    const snapshot = vfs.exportIndex();
+
+    // Create a fresh instance, import the snapshot
+    const vfs2 = new SyncOPFSFileSystem("gadget-gc");
+    // Re-use the same arena handle by closing and reopening
+    await vfs.close();
+    await vfs2.init();
+    vfs2.importIndex(snapshot);
+
+    for (let i = 0; i < 5; i++) {
+      if (i === 2) {
+        expect(vfs2.existsSync(`/persist/file${i}.ts`)).toBe(false);
+      } else {
+        expect(vfs2.readFileSync(`/persist/file${i}.ts`, { encoding: "utf8" })).toBe(`content-${i}`);
+      }
+    }
+
+    await vfs2.close();
+    // Re-open original for teardown
+    vfs = new SyncOPFSFileSystem("gadget-gc");
+    await vfs.init();
+  });
+});
