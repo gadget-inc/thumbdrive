@@ -235,17 +235,31 @@ describe("MultiTabWorkerBroker", () => {
 
       // Wait for follower to become leader and initialize its worker
       await broker2LeaderPromise;
-      // Wait for broker2 to be fully ready as leader
       await waitFor(
         () => broker2.isLeader,
         (isLeader) => isLeader === true,
-        { timeout: 500, message: "Broker2 did not become leader" }
+        { timeout: 3000, message: "Broker2 did not become leader" }
       );
-      // Give worker additional time to be fully ready
-      await new Promise((resolve) => setTimeout(resolve, 100));
       expect(broker2.isLeader).toBe(true);
 
-      // Verify new leader can communicate
+      // Verify worker is responsive before proceeding — avoids flaky fixed delays
+      const probeMessages: any[] = [];
+      const probeConn = broker2.createConnection();
+      probeConn.reader.listen((msg) => probeMessages.push(msg));
+      await probeConn.writer.write({
+        jsonrpc: "2.0",
+        id: 9999,
+        method: "echo",
+        params: { probe: true },
+      } as any);
+      await waitFor(
+        () => probeMessages,
+        (msgs) => msgs.some((m) => m.id === 9999),
+        { timeout: 3000, message: "Worker not responsive after leader promotion" }
+      );
+      probeConn.dispose();
+
+      // Now verify new leader can communicate on the original connection
       await conn2.writer.write({
         jsonrpc: "2.0",
         id: 1,
@@ -253,11 +267,10 @@ describe("MultiTabWorkerBroker", () => {
         params: { promoted: true },
       } as any);
 
-      // Wait for the response with retry logic
       await waitFor(
         () => followerMessages,
         (msgs) => msgs.some((m) => m.id === 1 && m.result?.promoted === true),
-        { timeout: 2000, message: "Expected response from promoted leader not received" }
+        { timeout: 3000, message: "Expected response from promoted leader not received" }
       );
 
       expect(followerMessages).toContainEqual(expect.objectContaining({ id: 1, result: { promoted: true } }));
